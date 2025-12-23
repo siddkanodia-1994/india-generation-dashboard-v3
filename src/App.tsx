@@ -13,23 +13,18 @@ import {
 } from "recharts";
 
 /**
- * India Electricity Generation Tracker (single-file React app)
+ * India Electricity Generation Tracker
  *
- * What it does
- * - Store daily all-India generation values locally (browser localStorage)
- * - Accept manual entry + CSV import
- * - Top chart: date slicer + frequency aggregation + series toggles
- * - Monthly totals + MoM/YoY growth (with partial-period windowing)
+ * IMPORTANT BEHAVIOR (as requested):
+ * - ALWAYS loads default data from GitHub-served CSV: /data/generation.csv
+ * - DOES NOT use localStorage
+ * - If you manually add/import during a session, it updates charts immediately
+ * - On refresh, it reloads from /data/generation.csv again
  *
- * CSV format (header optional)
- * - date,generation_gwh
- * - Date format: DD-MM-YYYY
- *
- * Note on units
- * - If you enter “units” as MU (million units), the number is the same as GWh (1 MU = 1 GWh).
+ * CSV format (header optional):
+ *   date,generation_gwh
+ *   Date format: DD-MM-YYYY
  */
-
-const STORAGE_KEY = "tusk_india_generation_v1";
 
 function clamp(n: number, min: number, max: number) {
   return Math.min(max, Math.max(min, n));
@@ -39,7 +34,6 @@ function clamp(n: number, min: number, max: number) {
 // Date helpers
 // ----------------------
 
-// Validate internal ISO date key (YYYY-MM-DD)
 function parseISOKey(s: string) {
   const ok = /^\d{4}-\d{2}-\d{2}$/.test(s);
   if (!ok) return null;
@@ -47,7 +41,7 @@ function parseISOKey(s: string) {
   return Number.isNaN(d.getTime()) ? null : s;
 }
 
-// Parse DD-MM-YYYY (preferred) -> ISO, also accept ISO for backward compatibility
+// Parse DD-MM-YYYY -> ISO YYYY-MM-DD (also accept ISO for backward compatibility)
 function parseInputDate(s: unknown) {
   if (typeof s !== "string") return null;
   const t = s.trim();
@@ -56,14 +50,7 @@ function parseInputDate(s: unknown) {
     const [dd, mm, yyyy] = t.split("-").map(Number);
     const d = new Date(Date.UTC(yyyy, mm - 1, dd));
     if (Number.isNaN(d.getTime())) return null;
-    // Guard against invalid dates like 31-02-2025
-    if (
-      d.getUTCFullYear() !== yyyy ||
-      d.getUTCMonth() !== mm - 1 ||
-      d.getUTCDate() !== dd
-    ) {
-      return null;
-    }
+    if (d.getUTCFullYear() !== yyyy || d.getUTCMonth() !== mm - 1 || d.getUTCDate() !== dd) return null;
     return `${yyyy}-${String(mm).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
   }
 
@@ -121,12 +108,6 @@ function asFiniteNumber(v: unknown): number | null {
   if (typeof v === "number" && Number.isFinite(v)) return v;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
-}
-
-// Visual-only rounding helper (keeps calculations precise elsewhere)
-function r2(n: number | null | undefined) {
-  if (n == null || !Number.isFinite(n)) return null;
-  return Number(n.toFixed(2));
 }
 
 // ----------------------
@@ -197,7 +178,7 @@ type DailyChartPoint = {
   units: number;
   prev_year_units: number | null;
   yoy_pct: number | null;
-  mom_pct: number | null; // weekly: WoW%, monthly: MoM%
+  mom_pct: number | null;
 };
 
 // ----------------------
@@ -209,16 +190,12 @@ function computeKPIs(sortedDaily: DailyPoint[]) {
     return {
       latest: null as DailyPoint | null,
       latestYoY: null as number | null,
-
       avg7: null as number | null,
       avg7YoY: null as number | null,
-
       avg30: null as number | null,
       avg30YoY: null as number | null,
-
       ytdTotal: null as number | null,
       ytdYoY: null as number | null,
-
       mtdAvg: null as number | null,
       mtdYoY: null as number | null,
     };
@@ -233,14 +210,9 @@ function computeKPIs(sortedDaily: DailyPoint[]) {
     const d = Number(iso.slice(8, 10));
 
     const tryDt = new Date(Date.UTC(y + deltaYears, m - 1, d));
-    if (
-      tryDt.getUTCFullYear() === y + deltaYears &&
-      tryDt.getUTCMonth() === m - 1 &&
-      tryDt.getUTCDate() === d
-    ) {
+    if (tryDt.getUTCFullYear() === y + deltaYears && tryDt.getUTCMonth() === m - 1 && tryDt.getUTCDate() === d) {
       return tryDt.toISOString().slice(0, 10);
     }
-
     const lastDay = new Date(Date.UTC(y + deltaYears, m, 0));
     return lastDay.toISOString().slice(0, 10);
   };
@@ -270,22 +242,26 @@ function computeKPIs(sortedDaily: DailyPoint[]) {
     return { startIso, endIso, avg: sum != null && count ? sum / count : null };
   };
 
+  // Latest day YoY
   const prevYearDate = isoAddYears(latest.date, -1);
   const prevYearVal = dailyLookup.get(prevYearDate) ?? null;
   const latestYoY = prevYearVal != null ? growthPct(latest.generation_gwh, prevYearVal) : null;
 
+  // 7D avg + YoY
   const last7 = avgForLastNDaysEnding(latest.date, 7);
   const py7 = sumAndCountInclusive(isoAddYears(last7.startIso, -1), isoAddYears(last7.endIso, -1));
   const avg7 = last7.avg;
   const avg7PY = py7.sum != null && py7.count ? py7.sum / py7.count : null;
   const avg7YoY = avg7 != null && avg7PY != null ? growthPct(avg7, avg7PY) : null;
 
+  // 30D avg + YoY
   const last30 = avgForLastNDaysEnding(latest.date, 30);
   const py30 = sumAndCountInclusive(isoAddYears(last30.startIso, -1), isoAddYears(last30.endIso, -1));
   const avg30 = last30.avg;
   const avg30PY = py30.sum != null && py30.count ? py30.sum / py30.count : null;
   const avg30YoY = avg30 != null && avg30PY != null ? growthPct(avg30, avg30PY) : null;
 
+  // FY-YTD (Apr 1 to latest)
   const latestY = Number(latest.date.slice(0, 4));
   const latestM = Number(latest.date.slice(5, 7));
   const fyStartYear = latestM >= 4 ? latestY : latestY - 1;
@@ -300,6 +276,7 @@ function computeKPIs(sortedDaily: DailyPoint[]) {
   const ytdTotalPY = ytdPY.sum;
   const ytdYoY = ytdTotal != null && ytdTotalPY != null ? growthPct(ytdTotal, ytdTotalPY) : null;
 
+  // MTD avg + YoY
   const thisMonthStart = `${latest.date.slice(0, 7)}-01`;
   const mtd = sumAndCountInclusive(thisMonthStart, latest.date);
   const mtdAvg = mtd.sum != null && mtd.count ? mtd.sum / mtd.count : null;
@@ -308,35 +285,20 @@ function computeKPIs(sortedDaily: DailyPoint[]) {
   const mtdAvgPY = mtdPY.sum != null && mtdPY.count ? mtdPY.sum / mtdPY.count : null;
   const mtdYoY = mtdAvg != null && mtdAvgPY != null ? growthPct(mtdAvg, mtdAvgPY) : null;
 
-  return {
-    latest,
-    latestYoY,
-    avg7,
-    avg7YoY,
-    avg30,
-    avg30YoY,
-    ytdTotal,
-    ytdYoY,
-    mtdAvg,
-    mtdYoY,
-  };
+  return { latest, latestYoY, avg7, avg7YoY, avg30, avg30YoY, ytdTotal, ytdYoY, mtdAvg, mtdYoY };
 }
 
 function buildMonthDayMap(sortedDaily: DailyPoint[]) {
   const map = new Map<string, { total: number; maxDay: number; byDay: Map<number, number> }>();
-
   for (const d of sortedDaily) {
     const m = monthKey(d.date);
     const day = Number(d.date.slice(8, 10));
-
     if (!map.has(m)) map.set(m, { total: 0, maxDay: 0, byDay: new Map() });
-
     const rec = map.get(m)!;
     rec.total += d.generation_gwh;
     rec.maxDay = Math.max(rec.maxDay, day);
     rec.byDay.set(day, (rec.byDay.get(day) || 0) + d.generation_gwh);
   }
-
   return map;
 }
 
@@ -397,10 +359,11 @@ function csvParse(text: string) {
     if (cols.length >= 2) rows.push(cols);
   }
 
+  // Drop header if present
   if (rows.length) {
     const h0 = rows[0][0].toLowerCase();
     const h1 = rows[0][1].toLowerCase();
-    if (h0.includes("date") && (h1.includes("gen") || h1.includes("gwh"))) rows.shift();
+    if (h0.includes("date") && (h1.includes("gen") || h1.includes("gwh") || h1.includes("unit"))) rows.shift();
   }
 
   const parsed: Array<{ date: string; generation_gwh: number }> = [];
@@ -415,12 +378,10 @@ function csvParse(text: string) {
       errors.push(`Row ${i + 1}: invalid date '${dRaw}' (expected DD-MM-YYYY)`);
       continue;
     }
-
     if (!Number.isFinite(g) || g < 0) {
       errors.push(`Row ${i + 1}: invalid generation '${gRaw}' (expected non-negative number)`);
       continue;
     }
-
     parsed.push({ date, generation_gwh: g });
   }
 
@@ -428,54 +389,16 @@ function csvParse(text: string) {
 }
 
 function sampleCSV() {
-  return ["date,generation_gwh", "18-12-2025,4140", "19-12-2025,4215", "20-12-2025,4198"].join("\n");
+  return [
+    "date,generation_gwh",
+    "18-12-2025,4140",
+    "19-12-2025,4215",
+    "20-12-2025,4198",
+  ].join("\n");
 }
 
 // ----------------------
-// Minimal self-tests (runs in dev only)
-// ----------------------
-
-function runDevSelfTests() {
-  // Vite exposes import.meta.env.MODE
-  const isProd = typeof import.meta !== "undefined" && (import.meta as any).env?.MODE === "production";
-  if (isProd) return;
-
-  console.assert(parseInputDate("01-04-2025") === "2025-04-01", "parseInputDate DD-MM-YYYY failed");
-  console.assert(parseInputDate("2025-04-01") === "2025-04-01", "parseInputDate ISO passthrough failed");
-  console.assert(parseInputDate("31-02-2025") === null, "parseInputDate invalid date should be null");
-  console.assert(formatDDMMYYYY("2025-04-01") === "01-04-2025", "formatDDMMYYYY failed");
-  console.assert(startOfWeekISO("2025-12-22") <= "2025-12-22", "startOfWeekISO ordering failed");
-
-  // extra: rounding helper
-  console.assert(r2(14.277780983) === 14.28, "r2 rounding failed");
-
-  const sd: DailyPoint[] = [
-    { date: "2024-10-01", generation_gwh: 10 },
-    { date: "2024-10-15", generation_gwh: 20 },
-    { date: "2024-10-20", generation_gwh: 999 },
-    { date: "2025-09-01", generation_gwh: 30 },
-    { date: "2025-09-15", generation_gwh: 30 },
-    { date: "2025-09-16", generation_gwh: 999 },
-    { date: "2025-10-01", generation_gwh: 20 },
-    { date: "2025-10-15", generation_gwh: 40 },
-  ];
-  const m = toMonthly(sd);
-  const oct2025 = m.find((r) => r.month === "2025-10");
-  console.assert(oct2025 && Math.round(oct2025.yoy_pct || 0) === 100, "partial-month YoY windowing failed");
-  console.assert(oct2025 && Math.round(oct2025.mom_pct || 0) === 0, "partial-month MoM windowing failed");
-
-  const fy: DailyPoint[] = [
-    { date: "2025-03-31", generation_gwh: 100 },
-    { date: "2025-04-01", generation_gwh: 10 },
-    { date: "2025-04-02", generation_gwh: 20 },
-    { date: "2026-04-02", generation_gwh: 999 },
-  ];
-  const k = computeKPIs(fy);
-  console.assert(k.ytdTotal === 30, "FY-YTD should sum from Apr 1 of FY");
-}
-
-// ----------------------
-// Small UI components
+// UI components
 // ----------------------
 
 function Card({
@@ -529,8 +452,7 @@ function EmptyState({ onLoadSample }: { onLoadSample: () => void }) {
       <div className="mx-auto max-w-xl">
         <div className="text-lg font-semibold text-slate-900">No data yet</div>
         <div className="mt-2 text-sm text-slate-600">
-          Add your first daily datapoint (units/MU) or import a CSV. The dashboard will compute monthly totals, YoY%, and
-          MoM%.
+          Upload the default CSV to <span className="font-mono">public/data/generation.csv</span> or import a CSV.
         </div>
         <div className="mt-5 flex flex-wrap justify-center gap-3">
           <button
@@ -550,25 +472,8 @@ function EmptyState({ onLoadSample }: { onLoadSample: () => void }) {
 // ----------------------
 
 export default function App() {
-  runDevSelfTests();
-
-  const [dataMap, setDataMap] = useState<Map<string, number>>(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return new Map();
-      const obj = JSON.parse(raw);
-      const entries = Object.entries(obj || {});
-      const m = new Map<string, number>();
-      for (const [k, v] of entries) {
-        const d = parseISOKey(k);
-        const g = Number(v);
-        if (d && Number.isFinite(g) && g >= 0) m.set(d, g);
-      }
-      return m;
-    } catch {
-      return new Map();
-    }
-  });
+  // DATA STATE (in-memory; always reset by GitHub CSV on refresh)
+  const [dataMap, setDataMap] = useState<Map<string, number>>(new Map());
 
   const [date, setDate] = useState(() => {
     const t = new Date();
@@ -582,12 +487,16 @@ export default function App() {
   const [msg, setMsg] = useState<string | null>(null);
   const [errors, setErrors] = useState<string[]>([]);
   const [rangeDays, setRangeDays] = useState(120);
-  const [fetchStatus, setFetchStatus] = useState<string | null>(null);
 
+  // Status for GitHub CSV load
+  const [defaultLoadStatus, setDefaultLoadStatus] = useState<string>("Loading /data/generation.csv ...");
+
+  // Slicer controls (ISO for date input)
   const [fromIso, setFromIso] = useState("");
   const [toIso, setToIso] = useState("");
   const [aggFreq, setAggFreq] = useState<"daily" | "weekly" | "monthly" | "rolling30">("daily");
 
+  // Series toggles
   const [showUnitsSeries, setShowUnitsSeries] = useState(true);
   const [showPrevYearSeries, setShowPrevYearSeries] = useState(true);
   const [showYoYSeries, setShowYoYSeries] = useState(true);
@@ -595,8 +504,48 @@ export default function App() {
 
   const [showControlLines, setShowControlLines] = useState(false);
 
-  // ✅ FIXED: correct file input ref
   const fileRef = useRef<HTMLInputElement | null>(null);
+
+  // ✅ ALWAYS LOAD FROM GITHUB CSV ON PAGE LOAD
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadDefaultCSV() {
+      try {
+        setDefaultLoadStatus("Loading /data/generation.csv ...");
+        const res = await fetch("/data/generation.csv", { cache: "no-store" });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const text = await res.text();
+
+        const { parsed, errors: errs } = csvParse(text);
+        if (cancelled) return;
+
+        if (!parsed.length) {
+          setDataMap(new Map());
+          setErrors(errs.length ? errs.slice(0, 12) : ["No valid rows found in /data/generation.csv"]);
+          setDefaultLoadStatus("Loaded, but no valid rows were found in /data/generation.csv");
+          return;
+        }
+
+        const m = new Map<string, number>();
+        for (const r of parsed) m.set(r.date, r.generation_gwh);
+
+        setDataMap(m);
+        setErrors(errs.slice(0, 12));
+        setDefaultLoadStatus(`Loaded ${parsed.length} rows from /data/generation.csv`);
+      } catch (e) {
+        if (cancelled) return;
+        setDataMap(new Map());
+        setErrors(["Could not load /data/generation.csv. Ensure it exists at public/data/generation.csv in GitHub."]);
+        setDefaultLoadStatus("Failed to load /data/generation.csv");
+      }
+    }
+
+    loadDefaultCSV();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const sortedDaily = useMemo<DailyPoint[]>(() => {
     return Array.from(dataMap.entries())
@@ -604,11 +553,7 @@ export default function App() {
       .sort((a, b) => sortISO(a.date, b.date));
   }, [dataMap]);
 
-  useEffect(() => {
-    const obj = Object.fromEntries(dataMap.entries());
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
-  }, [dataMap]);
-
+  // Initialize slicer range once data is present
   useEffect(() => {
     if (!sortedDaily.length) return;
     const lastIso = sortedDaily[sortedDaily.length - 1].date;
@@ -617,7 +562,6 @@ export default function App() {
   }, [sortedDaily, toIso, fromIso, rangeDays]);
 
   const anyTotalsShown = showUnitsSeries || showPrevYearSeries;
-  const anyTotalsForStats = showUnitsSeries || showPrevYearSeries;
   const anyPctShown = showYoYSeries || showMoMSeries;
 
   const dailyForChart = useMemo<DailyChartPoint[]>(() => {
@@ -651,6 +595,7 @@ export default function App() {
 
     if (aggFreq === "daily") {
       const sameDayPrevYear = (iso: string) => `${Number(iso.slice(0, 4)) - 1}${iso.slice(4)}`;
+
       const sameDayPrevMonth = (iso: string) => {
         const y = Number(iso.slice(0, 4));
         const m = Number(iso.slice(5, 7));
@@ -668,10 +613,10 @@ export default function App() {
 
         return {
           label: formatDDMMYYYY(d.date),
-          units: d.generation_gwh,
-          prev_year_units: py,
-          yoy_pct: py != null ? growthPct(d.generation_gwh, py) : null,
-          mom_pct: pm != null ? growthPct(d.generation_gwh, pm) : null,
+          units: Number(d.generation_gwh.toFixed(2)),
+          prev_year_units: py != null ? Number(py.toFixed(2)) : null,
+          yoy_pct: py != null ? Number(growthPct(d.generation_gwh, py)!.toFixed(2)) : null,
+          mom_pct: pm != null ? Number(growthPct(d.generation_gwh, pm)!.toFixed(2)) : null,
         };
       });
     }
@@ -683,15 +628,16 @@ export default function App() {
         const start = isoMinusDays(cur, 29);
         const currSum = sumRangeInclusive(start, cur);
 
+        // Compare to the equivalent 30D window ending one year earlier (approx by 365 days).
         const curPrevYear = isoMinusDays(cur, 365);
         const startPrevYear = isoMinusDays(curPrevYear, 29);
         const prevSum = sumRangeInclusive(startPrevYear, curPrevYear);
 
         points.push({
           label: formatDDMMYYYY(cur),
-          units: currSum ?? 0,
-          prev_year_units: prevSum,
-          yoy_pct: currSum != null && prevSum != null ? growthPct(currSum, prevSum) : null,
+          units: currSum != null ? Number(currSum.toFixed(2)) : 0,
+          prev_year_units: prevSum != null ? Number(prevSum.toFixed(2)) : null,
+          yoy_pct: currSum != null && prevSum != null ? Number(growthPct(currSum, prevSum)!.toFixed(2)) : null,
           mom_pct: null,
         });
 
@@ -743,10 +689,10 @@ export default function App() {
 
         return {
           label: `Wk of ${formatDDMMYYYY(wk)}`,
-          units: curr,
-          prev_year_units: prevYoY,
-          yoy_pct: prevYoY != null ? growthPct(curr, prevYoY) : null,
-          mom_pct: prevWoW != null ? growthPct(curr, prevWoW) : null,
+          units: Number(curr.toFixed(2)),
+          prev_year_units: prevYoY != null ? Number(prevYoY.toFixed(2)) : null,
+          yoy_pct: prevYoY != null ? Number(growthPct(curr, prevYoY)!.toFixed(2)) : null,
+          mom_pct: prevWoW != null ? Number(growthPct(curr, prevWoW)!.toFixed(2)) : null,
         };
       });
     }
@@ -794,100 +740,13 @@ export default function App() {
 
       return {
         label: m,
-        units: curr,
-        prev_year_units: prevYoY,
-        yoy_pct: prevYoY != null ? growthPct(curr, prevYoY) : null,
-        mom_pct: prevMoM != null ? growthPct(curr, prevMoM) : null,
+        units: Number(curr.toFixed(2)),
+        prev_year_units: prevYoY != null ? Number(prevYoY.toFixed(2)) : null,
+        yoy_pct: prevYoY != null ? Number(growthPct(curr, prevYoY)!.toFixed(2)) : null,
+        mom_pct: prevMoM != null ? Number(growthPct(curr, prevMoM)!.toFixed(2)) : null,
       };
     });
   }, [sortedDaily, rangeDays, fromIso, toIso, aggFreq]);
-
-  const controlStatsLeft = useMemo(() => {
-    if (!showControlLines) return null;
-    if (!dailyForChart.length) return null;
-
-    const values: number[] = [];
-
-    if (showUnitsSeries) {
-      for (const p of dailyForChart) {
-        const n = asFiniteNumber((p as any).units);
-        if (n != null) values.push(n);
-      }
-    } else if (showPrevYearSeries) {
-      for (const p of dailyForChart) {
-        const n = asFiniteNumber((p as any).prev_year_units);
-        if (n != null) values.push(n);
-      }
-    } else {
-      return null;
-    }
-
-    if (values.length < 2) return null;
-
-    const mean = values.reduce((a, b) => a + b, 0) / values.length;
-    const variance = values.reduce((a, b) => a + (b - mean) * (b - mean), 0) / values.length;
-    const sd = Math.sqrt(variance);
-
-    return {
-      mean,
-      sd,
-      p1: mean + sd,
-      p2: mean + 2 * sd,
-      m1: mean - sd,
-      m2: mean - 2 * sd,
-    };
-  }, [showControlLines, dailyForChart, showUnitsSeries, showPrevYearSeries]);
-
-  const controlStatsYoY = useMemo(() => {
-    if (!showControlLines) return null;
-    if (!dailyForChart.length) return null;
-    if (!showYoYSeries) return null;
-
-    const values: number[] = [];
-    for (const p of dailyForChart) {
-      const n = asFiniteNumber((p as any).yoy_pct);
-      if (n != null) values.push(n);
-    }
-
-    if (values.length < 2) return null;
-
-    const mean = values.reduce((a, b) => a + b, 0) / values.length;
-    const variance = values.reduce((a, b) => a + (b - mean) * (b - mean), 0) / values.length;
-    const sd = Math.sqrt(variance);
-
-    return {
-      mean,
-      sd,
-      p1: mean + sd,
-      p2: mean + 2 * sd,
-      m1: mean - sd,
-      m2: mean - 2 * sd,
-    };
-  }, [showControlLines, dailyForChart, showYoYSeries]);
-
-  const dailyForChartWithControl = useMemo(() => {
-    return dailyForChart.map((p) => ({
-      ...p,
-
-      // ✅ visual-only rounding for plotted points
-      units: r2(p.units) ?? p.units,
-      prev_year_units: p.prev_year_units != null ? (r2(p.prev_year_units) ?? p.prev_year_units) : null,
-      yoy_pct: p.yoy_pct != null ? (r2(p.yoy_pct) ?? p.yoy_pct) : null,
-      mom_pct: p.mom_pct != null ? (r2(p.mom_pct) ?? p.mom_pct) : null,
-
-      __mean_units: controlStatsLeft ? r2(controlStatsLeft.mean) : null,
-      __p1_units: controlStatsLeft ? r2(controlStatsLeft.p1) : null,
-      __p2_units: controlStatsLeft ? r2(controlStatsLeft.p2) : null,
-      __m1_units: controlStatsLeft ? r2(controlStatsLeft.m1) : null,
-      __m2_units: controlStatsLeft ? r2(controlStatsLeft.m2) : null,
-
-      __mean_yoy: controlStatsYoY ? r2(controlStatsYoY.mean) : null,
-      __p1_yoy: controlStatsYoY ? r2(controlStatsYoY.p1) : null,
-      __p2_yoy: controlStatsYoY ? r2(controlStatsYoY.p2) : null,
-      __m1_yoy: controlStatsYoY ? r2(controlStatsYoY.m1) : null,
-      __m2_yoy: controlStatsYoY ? r2(controlStatsYoY.m2) : null,
-    }));
-  }, [dailyForChart, controlStatsLeft, controlStatsYoY]);
 
   const monthly = useMemo(() => toMonthly(sortedDaily), [sortedDaily]);
 
@@ -895,9 +754,9 @@ export default function App() {
     if (!monthly.length) return [];
     return monthly.slice(Math.max(0, monthly.length - 24)).map((m) => ({
       month: m.month,
-      total_units: r2(m.total_gwh) ?? m.total_gwh,
-      yoy_pct: m.yoy_pct != null ? (r2(m.yoy_pct) ?? m.yoy_pct) : null,
-      mom_pct: m.mom_pct != null ? (r2(m.mom_pct) ?? m.mom_pct) : null,
+      total_units: Number(m.total_gwh.toFixed(2)),
+      yoy_pct: m.yoy_pct != null ? Number(m.yoy_pct.toFixed(2)) : null,
+      mom_pct: m.mom_pct != null ? Number(m.mom_pct.toFixed(2)) : null,
     }));
   }, [monthly]);
 
@@ -925,7 +784,7 @@ export default function App() {
       return next;
     });
 
-    setMsg(`Saved ${formatDDMMYYYY(iso)}: ${fmtNum(v)} units`);
+    setMsg(`Saved ${formatDDMMYYYY(iso)}: ${fmtNum(v)} units (session only; refresh reloads GitHub CSV)`);
     setGwh("");
   }
 
@@ -935,12 +794,6 @@ export default function App() {
       next.delete(isoDate);
       return next;
     });
-  }
-
-  function clearAll() {
-    if (!confirm("Clear all stored data from this browser?")) return;
-    setDataMap(new Map());
-    setMsg("Cleared all data.");
   }
 
   async function importCSV(file?: File) {
@@ -959,7 +812,7 @@ export default function App() {
       }
 
       setDataMap((prev) => mergeRecords(prev, parsed));
-      setMsg(`Imported ${parsed.length} rows${errs.length ? ` (with ${errs.length} issues)` : ""}.`);
+      setMsg(`Imported ${parsed.length} rows (session only; refresh reloads GitHub CSV).`);
     } catch {
       setErrors(["Could not read CSV."]);
     } finally {
@@ -970,46 +823,16 @@ export default function App() {
   function exportCSV() {
     const header = "date,generation_gwh";
     const lines = sortedDaily.map((d) => `${formatDDMMYYYY(d.date)},${d.generation_gwh}`);
-    downloadCSV(`india_generation_${new Date().toISOString().slice(0, 10)}.csv`, [header, ...lines].join("\n"));
+    downloadCSV(
+      `india_generation_${new Date().toISOString().slice(0, 10)}.csv`,
+      [header, ...lines].join("\n")
+    );
   }
 
   function loadSample() {
     const { parsed } = csvParse(sampleCSV());
     setDataMap((prev) => mergeRecords(prev, parsed));
-    setMsg("Loaded sample data.");
-  }
-
-  async function fetchLatestFromCEA() {
-    setFetchStatus(null);
-
-    const t = new Date();
-    const dd = String(t.getDate()).padStart(2, "0");
-    const mm = String(t.getMonth() + 1).padStart(2, "0");
-    const yyyy = t.getFullYear();
-    const ddmmyyyy = `${dd}-${mm}-${yyyy}`;
-
-    setFetchStatus(`Fetching for ${ddmmyyyy}...`);
-
-    try {
-      const res = await fetch(`/api/cea/daily?date=${encodeURIComponent(ddmmyyyy)}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const j = await res.json();
-
-      const iso = parseInputDate(j?.date);
-      const total = Number(j?.total_mu);
-      if (!iso) throw new Error("Bad date");
-      if (!Number.isFinite(total) || total < 0) throw new Error("Bad total_mu");
-
-      setDataMap((prev) => {
-        const next = new Map(prev);
-        next.set(iso, total);
-        return next;
-      });
-
-      setFetchStatus(`Fetched & saved ${j.date}: ${fmtNum(total)} units (incl. RE)`);
-    } catch {
-      setFetchStatus("Auto-fetch failed (backend not deployed / source changed).");
-    }
+    setMsg("Loaded sample data (session only; refresh reloads GitHub CSV).");
   }
 
   const hasData = sortedDaily.length > 0;
@@ -1021,8 +844,9 @@ export default function App() {
           <div>
             <div className="text-2xl font-semibold text-slate-900">India Electricity Generation Dashboard</div>
             <div className="mt-1 text-sm text-slate-600">
-              Track daily all-India generation (units/MU) and view monthly totals, YoY% and MoM% growth.
+              Default source: <span className="font-mono">/data/generation.csv</span> (GitHub)
             </div>
+            <div className="mt-1 text-xs text-slate-500">{defaultLoadStatus}</div>
           </div>
 
           <div className="flex flex-wrap gap-2">
@@ -1032,25 +856,13 @@ export default function App() {
             >
               Download sample CSV
             </button>
-            <button
-              onClick={fetchLatestFromCEA}
-              className="rounded-xl bg-slate-900 px-3 py-2 text-sm font-semibold text-white hover:bg-slate-800"
-            >
-              Auto-fetch latest (incl. RE)
-            </button>
+
             <button
               onClick={exportCSV}
               disabled={!hasData}
               className="rounded-xl bg-white px-3 py-2 text-sm font-semibold text-slate-700 ring-1 ring-slate-200 hover:bg-slate-50 disabled:opacity-50"
             >
               Export CSV
-            </button>
-            <button
-              onClick={clearAll}
-              disabled={!hasData}
-              className="rounded-xl bg-white px-3 py-2 text-sm font-semibold text-rose-700 ring-1 ring-slate-200 hover:bg-slate-50 disabled:opacity-50"
-            >
-              Clear data
             </button>
           </div>
         </div>
@@ -1080,11 +892,11 @@ export default function App() {
                 onClick={upsertOne}
                 className="mt-1 rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
               >
-                Save day
+                Save day (session only)
               </button>
 
               <div className="mt-2">
-                <div className="text-xs font-medium text-slate-600">Import CSV</div>
+                <div className="text-xs font-medium text-slate-600">Import CSV (session only)</div>
                 <div className="mt-2 flex items-center gap-2">
                   <input
                     ref={fileRef}
@@ -1105,12 +917,6 @@ export default function App() {
                 </div>
               ) : null}
 
-              {fetchStatus ? (
-                <div className="mt-2 rounded-xl bg-slate-900/5 p-3 text-sm text-slate-800 ring-1 ring-slate-200">
-                  {fetchStatus}
-                </div>
-              ) : null}
-
               {errors.length ? (
                 <div className="mt-2 rounded-xl bg-rose-50 p-3 text-sm text-rose-800 ring-1 ring-rose-200">
                   <div className="font-semibold">Import / input issues</div>
@@ -1121,6 +927,11 @@ export default function App() {
                   </ul>
                 </div>
               ) : null}
+
+              <div className="mt-2 text-xs text-slate-500">
+                To make changes permanent: edit <span className="font-mono">public/data/generation.csv</span> in GitHub and
+                commit. Vercel will redeploy automatically.
+              </div>
             </div>
           </Card>
 
@@ -1230,7 +1041,7 @@ export default function App() {
             }
           >
             {!hasData ? (
-              <div className="text-sm text-slate-600">Add data to see the daily chart.</div>
+              <div className="text-sm text-slate-600">Add data to see the chart.</div>
             ) : (
               <>
                 <div className="mb-3 rounded-2xl bg-slate-50 p-3 ring-1 ring-slate-200">
@@ -1355,7 +1166,7 @@ export default function App() {
                       </div>
 
                       <div className="mt-1 text-[11px] text-slate-500">
-                        Weekly/Monthly uses the same day-window for YoY and prior-period % (prevents partial-period distortion).
+                        Weekly/Monthly uses same day-window for YoY and prior-period % (prevents partial-period distortion).
                       </div>
                     </div>
                   </div>
@@ -1363,18 +1174,13 @@ export default function App() {
 
                 <div className="h-[340px]">
                   <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={dailyForChartWithControl} margin={{ top: 10, right: 18, bottom: 10, left: 8 }}>
+                    <LineChart data={dailyForChart} margin={{ top: 10, right: 18, bottom: 10, left: 8 }}>
                       <CartesianGrid strokeDasharray="3 3" />
                       <XAxis dataKey="label" tick={{ fontSize: 12 }} minTickGap={24} />
 
                       {anyTotalsShown ? (
-                        <YAxis
-                          yAxisId="left"
-                          tick={{ fontSize: 12 }}
-                          tickFormatter={(v) => fmtNum(asFiniteNumber(v) ?? null, 2)}
-                        />
+                        <YAxis yAxisId="left" tick={{ fontSize: 12 }} tickFormatter={(v) => fmtNum(asFiniteNumber(v) ?? null, 2)} />
                       ) : null}
-
                       {anyPctShown ? (
                         <YAxis
                           yAxisId="right"
@@ -1389,63 +1195,22 @@ export default function App() {
                           const key = (item && (item.dataKey as string)) || (name as string);
                           const num = asFiniteNumber(v);
 
-                          if (key === "units") {
-                            return [`${fmtNum(num ?? null, 2)} units`, aggFreq === "daily" ? "Generation" : "Total (current)"];
-                          }
-                          if (key === "prev_year_units") {
-                            return [`${fmtNum(num ?? null, 2)} units`, "Total (previous year)"];
-                          }
-
+                          if (key === "units") return [`${fmtNum(num ?? null, 2)} units`, "Total Current"];
+                          if (key === "prev_year_units") return [`${fmtNum(num ?? null, 2)} units`, "Total (previous year)"];
                           if (key === "yoy_pct") return [fmtPct(num ?? null, 2), "YoY %"];
                           if (key === "mom_pct") return [fmtPct(num ?? null, 2), aggFreq === "weekly" ? "WoW %" : "MoM %"];
-
-                          if (key === "__mean_units") return [`${fmtNum(num ?? null, 2)} units`, "Mean (units)"];
-                          if (key === "__p1_units") return [`${fmtNum(num ?? null, 2)} units`, "+1σ (units)"];
-                          if (key === "__p2_units") return [`${fmtNum(num ?? null, 2)} units`, "+2σ (units)"];
-                          if (key === "__m1_units") return [`${fmtNum(num ?? null, 2)} units`, "-1σ (units)"];
-                          if (key === "__m2_units") return [`${fmtNum(num ?? null, 2)} units`, "-2σ (units)"];
-
-                          if (key === "__mean_yoy") return [fmtPct(num ?? null, 2), "Mean (YoY%)"];
-                          if (key === "__p1_yoy") return [fmtPct(num ?? null, 2), "+1σ (YoY%)"];
-                          if (key === "__p2_yoy") return [fmtPct(num ?? null, 2), "+2σ (YoY%)"];
-                          if (key === "__m1_yoy") return [fmtPct(num ?? null, 2), "-1σ (YoY%)"];
-                          if (key === "__m2_yoy") return [fmtPct(num ?? null, 2), "-2σ (YoY%)"];
-
                           if (num != null) return [fmtNum(num, 2), String(name)];
                           return [v, String(name)];
                         }}
-                        labelFormatter={(l: any) =>
-                          `${aggFreq === "daily" ? "Date" : aggFreq === "weekly" ? "Week" : aggFreq === "monthly" ? "Month" : "Date"}: ${l}`
-                        }
                       />
                       <Legend />
-
-                      {showControlLines && controlStatsLeft && anyTotalsForStats ? (
-                        <>
-                          <Line yAxisId="left" type="monotone" dataKey="__mean_units" name="Mean (units)" dot={false} strokeWidth={2} stroke="#7c3aed" />
-                          <Line yAxisId="left" type="monotone" dataKey="__p1_units" name="+1σ (units)" dot={false} strokeWidth={1.5} stroke="#7c3aed" strokeDasharray="6 4" />
-                          <Line yAxisId="left" type="monotone" dataKey="__p2_units" name="+2σ (units)" dot={false} strokeWidth={1.5} stroke="#7c3aed" strokeDasharray="2 6" />
-                          <Line yAxisId="left" type="monotone" dataKey="__m1_units" name="-1σ (units)" dot={false} strokeWidth={1.5} stroke="#7c3aed" strokeDasharray="6 4" />
-                          <Line yAxisId="left" type="monotone" dataKey="__m2_units" name="-2σ (units)" dot={false} strokeWidth={1.5} stroke="#7c3aed" strokeDasharray="2 6" />
-                        </>
-                      ) : null}
-
-                      {showControlLines && controlStatsYoY && showYoYSeries ? (
-                        <>
-                          <Line yAxisId="right" type="monotone" dataKey="__mean_yoy" name="Mean (YoY%)" dot={false} strokeWidth={2} stroke="#0f766e" />
-                          <Line yAxisId="right" type="monotone" dataKey="__p1_yoy" name="+1σ (YoY%)" dot={false} strokeWidth={1.5} stroke="#0f766e" strokeDasharray="6 4" />
-                          <Line yAxisId="right" type="monotone" dataKey="__p2_yoy" name="+2σ (YoY%)" dot={false} strokeWidth={1.5} stroke="#0f766e" strokeDasharray="2 6" />
-                          <Line yAxisId="right" type="monotone" dataKey="__m1_yoy" name="-1σ (YoY%)" dot={false} strokeWidth={1.5} stroke="#0f766e" strokeDasharray="6 4" />
-                          <Line yAxisId="right" type="monotone" dataKey="__m2_yoy" name="-2σ (YoY%)" dot={false} strokeWidth={1.5} stroke="#0f766e" strokeDasharray="2 6" />
-                        </>
-                      ) : null}
 
                       {showUnitsSeries ? (
                         <Line
                           yAxisId="left"
                           type="monotone"
                           dataKey="units"
-                          name={aggFreq === "rolling30" ? "30D Rolling Sum (current)" : "Total Current"}
+                          name="Total Current"
                           dot={false}
                           strokeWidth={2}
                           stroke="#dc2626"
@@ -1457,7 +1222,7 @@ export default function App() {
                           yAxisId="left"
                           type="monotone"
                           dataKey="prev_year_units"
-                          name={aggFreq === "rolling30" ? "30D Rolling Sum (prev year)" : "Total (previous year)"}
+                          name="Total (previous year)"
                           dot={false}
                           strokeWidth={2}
                           stroke="#64748b"
@@ -1469,15 +1234,7 @@ export default function App() {
                       ) : null}
 
                       {showMoMSeries ? (
-                        <Line
-                          yAxisId="right"
-                          type="monotone"
-                          dataKey="mom_pct"
-                          name={aggFreq === "weekly" ? "WoW %" : "MoM %"}
-                          dot={false}
-                          strokeWidth={2}
-                          stroke="#dc2626"
-                        />
+                        <Line yAxisId="right" type="monotone" dataKey="mom_pct" name={aggFreq === "weekly" ? "WoW %" : "MoM %"} dot={false} strokeWidth={2} stroke="#dc2626" />
                       ) : null}
                     </LineChart>
                   </ResponsiveContainer>
@@ -1532,20 +1289,6 @@ export default function App() {
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
-
-                <div className="rounded-2xl bg-slate-50 p-4 ring-1 ring-slate-200">
-                  <div className="text-xs font-semibold text-slate-700">How growth is calculated</div>
-                  <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-slate-600">
-                    <li>
-                      <span className="font-medium">MoM%</span> compares the same day-range (e.g., 1st–15th vs 1st–15th of
-                      prior month if current month is incomplete).
-                    </li>
-                    <li>
-                      <span className="font-medium">YoY%</span> compares the same day-range (e.g., 1st–15th vs 1st–15th last
-                      year if current month is incomplete).
-                    </li>
-                  </ul>
-                </div>
               </div>
             )}
           </Card>
@@ -1583,10 +1326,6 @@ export default function App() {
               </div>
             )}
           </Card>
-        </div>
-
-        <div className="mt-6 text-xs text-slate-500">
-          Tip: Auto-fetch needs a backend proxy because CEA/NPP downloads often block browser-to-site requests (CORS). This UI expects an endpoint at /api/cea/daily.
         </div>
       </div>
     </div>
